@@ -1,6 +1,6 @@
-# Definition Processing API
+# LLM streaming proxy
 
-A simple web server for processing definition templates with language and industry customization.
+A simple web server for stream processing your prompts with LLMS
 
 ## Setup
 
@@ -19,26 +19,23 @@ A simple web server for processing definition templates with language and indust
    GOOGLE_API_KEY=your_google_api_key
 
    # Server configuration
-   PORT=5000
+   PORT=3000
    ```
 
 ## Running the Server
 
-```
-python main.py
-```
+The server will start on port 3000 by default (can be changed in `.env` file). In development it uses another port due to conflict with cockpit. Use the provided `bin/dev-server` script to start the server in development mode.
 
-The server will start on port 5000 by default (can be changed in `.env` file).
 
 ## API Endpoints
 
-### Process Definition
+### Streaming processing
 
 ```
-POST /definition
+POST /stream
 ```
 
-Processes a definition template with language and industry customization.
+Processes a prompt and streams response to prevent timeouts.
 
 #### Authentication
 
@@ -53,18 +50,18 @@ Authorization: Bearer your_secure_token
 
 ```json
 {
-    "provider": "anthropic",
-    "locale": "en-US",
-    "industry": "Plumbing",
-    "definition": "{\"templates\": [...], \"products\": [...], ...}"
+    "model": "gpt-4o",
+    "prompt": "Your instructions..."
 }
 ```
 
-- `provider`: The AI vendor to use for processing. Either `anthropic` or `google`.
-- `locale`: The locale code for language. Supported values: `en-US`, `ru`, `es-ES`.
-- `industry`: The industry to customize the definition for.
-- `definition`: The base definition string to process (optional).
+- `model`: The AI model to use for processing. Please refer to the provider's documentation for available models.
+- `prompt`: Instructions or text to be processed
 
+References:
+- [Anthropic Models](https://docs.claude.com/en/docs/about-claude/models/overview)
+- [OpenAI Models](https://platform.openai.com/docs/models)
+- [Google Models](https://ai.google.dev/gemini-api/docs/models)
 #### Response
 
 ```json
@@ -100,13 +97,11 @@ The API returns appropriate HTTP status codes and error messages:
 ## Example Request with cURL
 
 ```bash
-curl -X POST http://localhost:5000/definition \
+curl -X POST http://localhost:5500/stream \
   -H "Authorization: Bearer your_secure_token" \
   -H "Content-Type: application/json" \
   -d '{
-    "provider": "anthropic",
-    "locale": "en-US",
-    "industry": "Plumbing",
-    "definition": "base definition if needed"
+    "model": "gpt-4o",
+    "prompt": "Your instructions..."
   }'
 ```

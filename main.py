@@ -1,24 +1,35 @@
-from anthropic import Anthropic
-from google import genai
-import time
-import os
-from flask import Flask, request, jsonify
-from functools import wraps
+from anthropic import AsyncAnthropic
+import asyncio
 from dotenv import load_dotenv
-from openai import OpenAI
+from quart import Quart, request, jsonify, Response
+from functools import wraps
+from google import genai
+import json
+from openai import AsyncOpenAI
+import os
+import logging
 
-# Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
+app = Quart(__name__)
 
-# Configure Bearer token authentication
-# In a production environment, use a more secure token management system
+root = logging.getLogger()
+for handler in root.handlers[:]:
+    root.removeHandler(handler)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] [%(process)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)
+
 API_TOKEN = os.environ.get("API_TOKEN", "default_token")
 
 def token_required(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
+    async def decorated(*args, **kwargs):
         token = None
         auth_header = request.headers.get('Authorization')
 
@@ -32,204 +43,151 @@ def token_required(f):
         if token != API_TOKEN:
             return jsonify({'message': 'Invalid token!'}), 401
 
-        return f(*args, **kwargs)
+        return await f(*args, **kwargs)
 
     return decorated
 
-def language(locale):
-    if locale == 'ru':
-        return 'Russian'
-    elif locale == 'es-ES':
-        return 'Spanish'
+def provider(model):
+    if model.startswith('claude'):
+        return 'anthropic'
+    elif model.startswith('gemini'):
+        return 'google'
+    elif model.startswith('gpt') or model.startswith('o'):
+        return 'openai'
     else:
-        return 'English'
+        return 'unknown'
 
-def base_definition_text(base_definition):
-    if base_definition is None:
-        return ""
+async def anthropic_stream(model, prompt, request_id):
+    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    usage = None
+    if 'opus' in model:
+        max_tokens = 32000
     else:
-        return "Use following definition as a base for your output:\n" + base_definition
+        max_tokens = 64000
 
-def process_definition(provider, locale, industry, base_definition):
-    LANGUAGE = language(locale)
+    async with client.messages.stream(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        async for event in stream:
+            if event.type == "message_stop" and hasattr(event.message, 'usage'):
+                metadata = event.message.usage
+                usage = {
+                    "input": metadata.input_tokens,
+                    "output": metadata.output_tokens
+                }
+            elif event.type == "content_block_delta":
+              yield {"type": "delta", "text": event.delta.text}
 
-    contents = """
-        You are asked to generate a JSON definition for a new tenant.
-        Output valid JSON only. Do not include any comments, explanations, or extra properties.
+        logger.info(f"[{request_id}] Streaming completed")
+        yield {"type": "done", "usage": usage}
 
-        --- SCHEMA
-        The JSON must contain these top-level arrays:
-        { "catalog_units": [...], "categories": [...], "products": [...], "services": [...], "templates": [...] }
 
-        ### catalog_units
-        - Objects: {id:string, name:string, code:string, type:"products"|"services", system:boolean (only for type:"services")}
-        - Exactly 3:
-          - 1 service catalog unit, must include id:"catalog_unit-0", code:"service", type:"services", system:true and name in {LANGUAGE}
-          - 2 product catalog units, with {INDUSTRY}-specific names and codes
-
-        ### categories
-        - Objects: {id:string, name:string, type:"products"|"services", archived:boolean}
-        - Exactly 2: 1 for products, 1 for services
-
-        ### products
-        - Objects: {id:string, name:string, currency:string (ISO-4217 lowercase), unit:string (catalog_unit id), category:string (category id, optional), price_default:string (decimal, optional), archived:boolean}
-        - Exactly 2
-
-        ### services
-        - Objects: {id:string, name:string, currency:string (ISO-4217 lowercase), unit:string (catalog_unit id), category:string (category id, optional), price_default:string (decimal, optional), archived:false}
-        - Exactly 2
-
-        ### templates
-        - Objects: {id:string, name:string, job_type:"job_type-0", possible_resolutions:["resolution-0","resolution-1"], scheduled_duration_min:integer, can_be_used_on_mobile:true, custom_fields:object[], report_fields:object[]}
-        - Exactly 5
-        - Each template must contain:
-          - ≥2 custom_fields
-          - ≥5 report_fields
-
-        ### custom_fields
-        Object properties:
-        - {id:string, type:string, name:string, field_type:string, data_type:string}
-
-        ### report_fields
-        Object properties:
-        - Same as custom_fields
-        - Plus: required:boolean (default true), signed_field:string (only if field_type == "signature")
-
-        --- FIELD_TYPE ⇄ DATA_TYPE (valid combinations only)
-        Custom fields:
-        - currency → currency
-        - input → string | decimal | integer
-        - file → attachment
-        - button → boolean
-        - dictionary → dictionary
-        - link → url
-        - date → date_picker
-        - time → time_picker
-        - datetime → datetime_picker
-
-        Report fields:
-        - Same as custom field combinations
-        - Plus:
-          - image → attachment
-          - signature → attachment
-            - must represent **customer signature** only
-            - must include signed_field referencing a **custom_field of type:"file"** from the same template representing some document
-          - checkbox → boolean
-
-        --- CARDINALITY
-        - catalog_units: 3 (2 products, 1 service with fixed name/code)
-        - categories: 2 (1 product, 1 service)
-        - products: 2
-        - services: 2
-        - templates: 5 (≥2 custom_fields, ≥5 report_fields each)
-
-        --- ID RULES
-        - IDs must follow sequential, end-to-end order per entity type:
-          - catalog_units: catalog_unit-0 … catalog_unit-2
-          - categories: category-0 … category-1
-          - products: product-0 … product-1
-          - services: service-0 … service-1
-          - templates: template-0 … template-4
-        - **custom_fields and report_fields share one global counter across ALL templates:**
-          - IDs and types start at custom_field-0 and custom_field_type-0 in the first template and increment continuously across all templates.
-          - Example: if template-0 has 2 custom_fields + 5 report_fields, their IDs are custom_field-0 … custom_field-6. Template-1 continues with custom_field-7, etc.
-        - signed_field in a signature report_field must point only to a **file-type custom_field** from the same template.
-
-        --- CONTENT
-        - All names, codes, and values must be realistic and relevant to the {INDUSTRY} and in {LANGUAGE}.
-        - Use lowercase ISO-4217 for currency.
-        - Use decimal strings for price_default (e.g., "12.50").
-        - All references (unit, category, signed_field) must point to existing IDs defined in this JSON.
-
-        --- OUTPUT
-        Return only the JSON object.
-
-    """.replace('{INDUSTRY}', industry).replace('{LANGUAGE}', LANGUAGE) + base_definition_text(base_definition)
-
-    start = time.time()
-    print("Starting generation")
-
-    if provider == 'anthropic':
-        API_KEY = os.environ.get("ANTHROPIC_API_KEY", "default_key")
-
-        client = Anthropic(api_key=API_KEY)
-
-        response = client.messages.create(
-          model="claude-sonnet-4-0",
-          max_tokens=10000,
-          messages=[{"role": "user", "content": contents}]
-        )
-        result = response.content[0].text
-    elif provider == 'google':
-        API_KEY = os.environ.get("GOOGLE_API_KEY", "default_key")
-
-        client = genai.Client(api_key=API_KEY)
-
-        response = client.models.generate_content(
-          model="gemini-2.5-flash", contents=contents
-        )
-        result = response.text
-    elif provider == 'openai':
-        API_KEY = os.environ.get("OPENAI_API_KEY", "default_key")
-
-        client = OpenAI(api_key=API_KEY)
-
-        response = client.chat.completions.create(
-          model="gpt-4o",
-          messages=[
-            {"role": "user", "content": contents}
-          ],
-          temperature=0.3,
-          max_tokens=10000
-        )
-
-        result = response.choices[0].message.content
+async def openai_stream(model, prompt, request_id):
+    client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    if model.startswith('gpt-5') or model.startswith('o'):
+      temperature = 1
     else:
-        result = "Unsupported provider. Please use 'anthropic' or 'google' or 'openai'."
+      temperature = 0.3
 
-    end = time.time()
-    print(f"Generation completed in {round(end - start, 2)} seconds")
-    return result
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+        temperature=temperature,
+        stream_options={"include_usage": True}
+    )
 
-@app.route('/definition', methods=['POST'])
+    usage = None
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0] and chunk.choices[0].delta.content:
+            delta = chunk.choices[0].delta.content
+            yield {"type": "delta", "text": delta}
+        elif chunk.usage:
+            usage = {
+                "input": chunk.usage.prompt_tokens,
+                "output": chunk.usage.total_tokens - chunk.usage.prompt_tokens
+            }
+
+    logger.info(f"[{request_id}] Streaming completed")
+    yield {"type": "done", "usage": usage}
+
+async def google_stream(model, prompt, request_id):
+    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+    usage = None
+    # Pseudocode: open streaming request
+    stream = client.models.generate_content_stream(
+        contents=[{"role": "user", "parts":[{"text": prompt}]}],
+        model=model,
+        # maybe streaming=True or the method name implies streaming
+    )
+
+    for resp in stream:
+        # Each `resp` may contain partial content and optionally usage
+        text = resp.candidates[0].content.parts[0].text
+        if hasattr(resp, "usage_metadata"):
+            metadata = resp.usage_metadata
+            usage = {
+                "input": metadata.prompt_token_count,
+                "output": metadata.total_token_count - metadata.prompt_token_count
+            }
+        if text:
+            yield {"type": "delta", "text": text}
+
+    logger.info(f"[{request_id}] Streaming completed")
+    yield {"type": "done", "usage": usage}
+
+@app.route("/stream", methods=["POST"])
 @token_required
-def process_endpoint():
+async def process_stream():
     """
-    Process definition endpoint
-
-    Expected JSON body:
-    {
-        "provider": "anthropic",
-        "locale": "en-US",
-        "industry": "Plumbing",
-        "definition": "base definition maybe"
-    }
+    Streaming LLM Endpoint
+    Body:
+      {
+        "model": "gpt-4o-mini",
+        "prompt": "Explain streaming requests..."
+      }
     """
-    try:
-        data = request.get_json()
+    data = await request.get_json(force=True)
+    model = data.get("model", "gpt-4o-mini")
+    prompt = data.get("prompt")
+    if not prompt:
+        return jsonify({"error": "No prompt provided"}), 400
 
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
+    prov = provider(model)
+    if prov == "unknown":
+        return jsonify({"error": f"Unsupported model: {model}"}), 400
 
-        # Extract required parameters from request
-        provider = data.get('provider', 'anthropic')
-        locale = data.get('locale', 'en-US')
-        industry = data.get('industry', 'General')
-        definition = data.get('definition', None)
+    request_id = os.urandom(8).hex()
 
-        # Process the definition
-        result = process_definition(provider, locale, industry, definition)
-        print(result)
-        return jsonify({"result": result})
+    logger.info(f"[{request_id}] Streaming from {prov} ({model})")
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    async def generate():
+        try:
+            match prov:
+                case "anthropic":
+                    async for chunk in anthropic_stream(model, prompt, request_id):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                case "openai":
+                    async for chunk in openai_stream(model, prompt, request_id):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                case "google":
+                    async for chunk in google_stream(model, prompt, request_id):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as e:
+            logger.error(f"[{request_id}] Error during streaming: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    response = Response(generate(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
+    response.timeout = None  # Disable Quart's 60-second response timeout
+    return response
 
 @app.route('/health', methods=['GET'])
-def health_check():
+async def health_check():
     return jsonify({"status": "healthy"}), 200
-
-if __name__ == "__main__":
-    # Set to False in production
-    app.debug = True
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
